@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "name": "bank",
+  "furniture_type": "bench",
+  "source_image": "fixtures/drawings/bank.png",
+  "units": "mm",
+  "overall": {"width": 1130, "depth": 580, "height": 840},
+  "params": {
+    "seat_height": 440,
+    "seat_width": 1030,
+    "seat_depth": 410,
+    "seat_thickness": 40,
+    "frame_member": 40,
+    "armrest_height": 620,
+    "stretcher_height": 150,
+    "backrest_thickness": 30
+  },
+  "measurements": [
+    {"label": "overall width", "cm": 113, "inch": "44 1/2", "maps_to": "overall.width"},
+    {"label": "overall depth at floor", "cm": 58, "inch": "22 7/8", "maps_to": "overall.depth"},
+    {"label": "overall height", "cm": 84, "inch": "33 1/8", "maps_to": "overall.height"},
+    {"label": "seat height", "cm": 44, "inch": "17 3/8", "maps_to": "params.seat_height"},
+    {"label": "seat width between armrests", "cm": 103, "inch": "40 1/2", "maps_to": "params.seat_width"},
+    {"label": "seat depth", "cm": 41, "inch": "16 1/8", "maps_to": "params.seat_depth"}
+  ],
+  "assumptions": [
+    "Rattan frame simplified to rectangular members: each side frame is a front post, back post, armrest and low stretcher; side frame width (113 - 103) / 2 = 5 cm.",
+    "Curved rattan seat and backrest modelled as flat slabs; backrest leans from the seat rear edge to the top rear corner.",
+    "Armrest top at 620 mm, stretcher at 150 mm, member section 40 mm, seat slab 40 mm, backrest 30 mm (not dimensioned, estimated from the drawing).",
+    "The seat front edge is flush with the front posts."
+  ],
+  "ambiguities": [
+    "41 cm is drawn at armrest height from the backrest to the front post; read as seat depth, it could also be the armrest length.",
+    "103 cm is drawn diagonally in perspective; read as the clear width between the side frames.",
+    "58 cm is measured at the floor between splayed legs; the model has vertical posts, so the full depth is used at every height.",
+    "Overall height 84 cm is taken as the top of the backrest; the curved top roll is flattened."
+  ]
+}

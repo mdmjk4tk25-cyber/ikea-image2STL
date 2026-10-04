@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "schrank",
+  "furniture_type": "cabinet",
+  "source_image": "fixtures/drawings/schrank.png",
+  "units": "mm",
+  "overall": {"width": 700, "depth": 350, "height": 700},
+  "params": {
+    "panel_thickness": 18,
+    "back_thickness": 3,
+    "door_count": 2,
+    "door_thickness": 18,
+    "door_gap": 3,
+    "shelf_count": 0,
+    "shelf_thickness": 18
+  },
+  "measurements": [
+    {"label": "front view, width", "cm": 70, "inch": "27 1/2", "maps_to": "overall.width"},
+    {"label": "front view, height", "cm": 70, "inch": "27 1/2", "maps_to": "overall.height"},
+    {"label": "side view, depth", "cm": 35, "inch": "13 3/4", "maps_to": "overall.depth"}
+  ],
+  "assumptions": [
+    "Depth 35 cm includes the doors; doors are inset flush with the carcass front.",
+    "Panel and door thickness 18 mm, back panel 3 mm, door gap 3 mm (standard chipboard values, not dimensioned).",
+    "Door count 2 read from the vertical split in the front view.",
+    "No inner shelves: the drawing shows none (shelf_count 0)."
+  ],
+  "ambiguities": [
+    "The chamfered corners of the outer frame suggest a mitred or rounded carcass edge; modelled as square edges.",
+    "The double line inside the frame could be a door frame profile or the door/carcass gap; modelled as a plain gap."
+  ]
+}

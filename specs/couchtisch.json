@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "couchtisch",
+  "furniture_type": "coffee_table",
+  "source_image": "fixtures/drawings/couchtisch.png",
+  "units": "mm",
+  "overall": {"width": 900, "depth": 550, "height": 450},
+  "params": {
+    "top_thickness": 50,
+    "leg_size": 50,
+    "shelf_thickness": 10,
+    "shelf_clearance_below_top": 190,
+    "shelf_height": 200
+  },
+  "measurements": [
+    {"label": "length", "cm": 90, "inch": "35 3/8", "maps_to": "overall.width"},
+    {"label": "width", "cm": 55, "inch": "21 5/8", "maps_to": "overall.depth"},
+    {"label": "height", "cm": 45, "inch": "17 3/4", "maps_to": "overall.height"},
+    {"label": "tabletop underside to shelf top", "cm": 19, "inch": "7 1/2", "maps_to": "params.shelf_clearance_below_top"},
+    {"label": "floor to shelf underside", "cm": 20, "inch": "7 7/8", "maps_to": "params.shelf_height"}
+  ],
+  "assumptions": [
+    "The 19 cm dimension runs from the tabletop underside to the shelf top; the 20 cm dimension from the floor to the shelf underside. The small gap between them is the shelf thickness.",
+    "Shelf thickness 10 mm (not dimensioned); top thickness follows from 450 - 190 - 10 - 200 = 50 mm.",
+    "Legs are 50 x 50 mm and flush with the tabletop edges.",
+    "Shelf spans between the inner leg faces along the length and uses the full table depth."
+  ],
+  "ambiguities": [
+    "The extension lines of the 19/20 cm dimensions are drawn at a back leg in perspective; the start of the 19 cm line could also be the tabletop surface, which would not add up to 45 cm.",
+    "The shelf support brackets visible under the shelf centre are not dimensioned and are omitted."
+  ]
+}
