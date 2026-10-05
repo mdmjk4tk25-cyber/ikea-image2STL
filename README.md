@@ -4,32 +4,32 @@ Python-CLI, die bemaßte IKEA-Möbelzeichnungen (PNG, Maße in cm und Zoll) in p
 
 ```
 Zeichnung.png ──extract──▶ specs/<name>.json ──build──▶ out/<name>/*.step|*.stl ──validate──▶ validation.json
-                (Claude)    (von Hand prüfen)  (build123d)
+              (lokale OCR)  (von Hand prüfen)  (build123d)
 ```
 
 ## Setup
 
 ```bash
-uv sync --dev                      # Python 3.12, build123d, anthropic, pytest
+uv sync --dev                      # Python 3.12, build123d, rapidocr-onnxruntime, pytest
 uv run furniture --help
 ```
 
 `cadquery-ocp-novtk` (OCP-Kernel von build123d) linkt direkt gegen `libGL.so.1` (per `ldd` geprüft). Ohne `libgl1` schlägt der Import fehl, der libGL-Block im Setup-Skript bleibt also nötig.
 
-Umgebungsvariablen: `ANTHROPIC_API_KEY` (nur für `extract` und `all`), `CLAUDE_MODEL` (Default `claude-sonnet-5-5`).
+Alles läuft lokal. Netzwerk wird nur für `uv sync` (PyPI) gebraucht, zur Laufzeit gibt es keine externen Aufrufe und keinen API-Key.
 
 ## Befehle
 
 | Befehl | Was passiert |
 |---|---|
-| `furniture extract BILD [--spec PFAD] [--type TYP] [--model M]` | Claude liest die Maße und schreibt `specs/<bildname>.json`. Ist die Spec ungültig, wird sie trotzdem geschrieben, Exit-Code 1 und Fehlerliste zum Korrigieren. |
+| `furniture extract BILD --type TYP [--spec PFAD]` | Lokale OCR liest die Maße, eine Regel je Möbeltyp ordnet sie den Spec-Feldern zu, Ergebnis `specs/<bildname>.json`. `TYP` ist `cabinet`, `coffee_table` oder `bench`. Ist die Spec ungültig, wird sie trotzdem geschrieben, Exit-Code 1 und Fehlerliste zum Korrigieren. |
 | `furniture build SPEC [--out out]` | Validiert die Spec, baut die Teile und schreibt `out/<name>/<name>.step`, `<name>.stl` und `parts/<teil>.step/.stl`. |
 | `furniture validate SPEC [--out out]` | Prüft die exportierten Dateien, schreibt `out/<name>/validation.json`, Exit-Code 1 bei Fehlern. |
 | `furniture all BILD [...]` | `extract`, `build`, `validate` hintereinander. Stoppt, wenn die extrahierte Spec ungültig ist. |
 
 Empfohlener Ablauf: `extract`, Spec von Hand prüfen und korrigieren, dann `build` und `validate`.
 
-Beispiel mit den mitgelieferten, von Hand geprüften Specs (ohne API-Key):
+Beispiel mit den mitgelieferten, von Hand geprüften Specs:
 
 ```bash
 uv run furniture build specs/couchtisch.json && uv run furniture validate specs/couchtisch.json
@@ -73,15 +73,35 @@ Die Parameter je Typ, ihre Bedeutung und die Default-Annahmen stehen in `FURNITU
 - Jede Teil-STL ist wasserdicht: jede Kante gehört zu genau zwei Dreiecken, die sie in entgegengesetzter Richtung durchlaufen (keine Löcher, nicht-manifold Kanten oder gekippten Normalen). Eigener STL-Parser in `mesh.py`, nur Standardbibliothek.
 - Bounding Box der Gesamt-STEP und der Gesamt-STL entspricht Breite, Tiefe und Höhe der Spec auf 0,5 mm.
 
-## Extract
+## Extract (lokal)
 
-`extract.py` schickt das Bild an die Messages API mit Structured Outputs (`output_config.format` mit JSON-Schema). Der Prompt enthält alle Typen und Parameter mit Bedeutung und Default. Das Modell markiert jeden Parameter als `drawing` oder `assumed`. Angenommene Werte und fehlende Parameter (mit Default aufgefüllt) werden in `assumptions` vermerkt.
+`extract.py` arbeitet in drei Schritten, ohne Netzwerk:
 
-Hinweise:
+1. **OCR:** [RapidOCR](https://github.com/RapidAI/RapidOCR) (`rapidocr-onnxruntime`, PaddleOCR-Modelle als ONNX, im Wheel enthalten) liefert jede Textbox mit Position und Ausrichtung. Boxen mit `NN cm` werden zu Maßen. Zoll-Text in einer eigenen Box (zweizeilige Beschriftung) wird dem nächsten cm-Maß zugeordnet.
+2. **Zuordnung je Typ:** Eine Regel ordnet die cm-Werte den Spec-Feldern zu. Eine Box gilt als senkrecht, wenn sie mehr als 1,5-mal so hoch wie breit ist.
+   - `cabinet`: senkrecht = Höhe; waagerecht größter Wert = Breite, nächster = Tiefe.
+   - `coffee_table`: waagerecht größter = Länge, nächster = Breite; senkrecht größter = Höhe; von den übrigen senkrechten das obere = Plattenunterkante bis Ablage, das untere = Boden bis Ablage. `top_thickness` wird daraus und aus der angenommenen Ablagenstärke berechnet.
+   - `bench`: waagerecht nach Größe = Breite, Sitzbreite, Tiefe, Sitztiefe; senkrecht nach Größe = Höhe, Sitzhöhe.
+3. **Defaults:** Nicht bemaßte Parameter bekommen ihren Default und einen Eintrag in `assumptions`. Fehlende Gesamtmaße werden auf 0 gesetzt und in `ambiguities` gemeldet; die Spec ist dann ungültig und muss von Hand ergänzt werden.
 
-- `extract` wurde in dieser Umgebung nicht live gegen die API ausgeführt (kein API-Key in der Session). Die Tests decken die Anfrage und die Umwandlung mit einem Fake-Client ab.
-- Bei `stop_reason == "refusal"` bricht `extract` mit Fehlermeldung ab; ein serverseitiger Fallback auf ein anderes Modell ist nicht konfiguriert.
-- Tests brauchen keinen API-Key (`tests/conftest.py` entfernt ihn sogar).
+Zoll-Angaben dienen nur der Gegenprüfung. OCR liest Brüche oft falsch („½“ als `12` oder `%2`, `173/4` statt `17 3/4`, `s` statt `8`). Diese Fälle werden korrigiert; ist der Zoll-Wert danach nicht plausibel zum cm-Wert, bleibt `inch` leer und die Gegenprüfung entfällt.
+
+### Genauigkeit auf den Referenzzeichnungen
+
+| Zeichnung | cm-Maße gelesen | richtig zugeordnet | Zoll lesbar |
+|---|---|---|---|
+| Schrank | 3/3 | 3/3 | 3/3 |
+| Couchtisch | 5/5 | 5/5 | 4/5 |
+| Bank | 6/6 | 6/6 | 2/6 |
+| **Summe** | **14/14** | **14/14** | **9/14** |
+
+Die erzeugten Specs sind identisch mit den Hand-Specs in `specs/` (Gesamtmaße und Parameter). Bei den Parametern liegt das daran, dass die Hand-Specs dieselben Defaults verwenden; gelesen werden nur die bemaßten Werte. Laufzeit: etwa 1 s pro Zeichnung auf CPU.
+
+Grenzen: Die Zuordnungsregeln sind auf das Layout dieser IKEA-Zeichnungen zugeschnitten (Wertrangfolge, Ausrichtung, Position). Bei anderen Layouts kann eine Zuordnung falsch sein; die Validierung fängt das nur ab, wenn die Werte geometrisch nicht zusammenpassen. Deshalb die Spec vor `build` prüfen.
+
+Verworfene Alternativen:
+- **Tesseract 5.3:** las auf denselben Zeichnungen nur 4 von 14 cm-Maßen richtig (2 weitere falsch, z. B. `403` statt `103`); gedrehte und schräge Beschriftungen fehlten.
+- **Lokales Vision-Sprachmodell (z. B. über Ollama):** mehrere GB Modell, auf CPU langsam und nicht deterministisch. Die OCR liest hier schon alle Maße; das Schwierige ist die Zuordnung, und die ist mit Regeln nachvollziehbar und testbar.
 
 ## Referenzzeichnungen und Annahmen
 
@@ -143,4 +163,4 @@ Mehrdeutigkeiten:
 uv run pytest
 ```
 
-Abgedeckt: Spec-Validierung, Zoll-Parser, STL-Wasserdichtheit (Loch, gekipptes Dreieck, Binär- und ASCII-STL), Build und Validierung aller drei Referenz-Specs, Parametrik (andere Gesamtmaße, Türen und Böden verschieben die Geometrie), Erkennung einer 1-mm-Abweichung, `extract` und `all` mit Fake-Client.
+Abgedeckt: Spec-Validierung, Zoll-Parser, STL-Wasserdichtheit (Loch, gekipptes Dreieck, Binär- und ASCII-STL), Build und Validierung aller drei Referenz-Specs, Parametrik (andere Gesamtmaße, Türen und Böden verschieben die Geometrie), Erkennung einer 1-mm-Abweichung, `extract` mit echter OCR auf allen drei Zeichnungen (Werte und Zuordnung müssen den Hand-Specs entsprechen), Zuordnungsregeln und Zoll-Normalisierung mit Fake-OCR, `all` komplett lokal.

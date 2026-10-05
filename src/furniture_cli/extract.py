@@ -1,197 +1,275 @@
-"""Extract stage: dimensioned drawing (PNG/JPEG) -> spec JSON via Claude.
+"""Extract stage: dimensioned drawing (PNG/JPEG) -> spec JSON, fully local.
 
-The model returns JSON constrained by a JSON schema (structured outputs).
-The result is merged with the per-type parameter defaults, so every value
-the drawing does not show is written into the spec explicitly as an
-assumption that can be reviewed and corrected by hand before building.
+1. OCR (RapidOCR, ONNX models bundled in the wheel, no network) finds the
+   dimension labels such as "70 cm (27 1/2")" with their position and
+   orientation.
+2. A per-type rule maps each cm value to a spec field (overall width, seat
+   height, ...). The rules use value ranking, text orientation and position.
+3. Every parameter the drawing does not show is filled with its default and
+   recorded in ``assumptions``. The spec is meant to be reviewed by hand
+   before building.
 """
 
 from __future__ import annotations
 
-import base64
-import json
-import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
-import anthropic
+from .spec import CM_INCH_TOLERANCE_MM, FURNITURE_TYPES, SCHEMA_VERSION, parse_inch
 
-from .spec import FURNITURE_TYPES, SCHEMA_VERSION
+# Text box is treated as vertical (rotated label) when taller than wide by this factor.
+VERTICAL_ASPECT = 1.5
 
-DEFAULT_MODEL = "claude-sonnet-5-5"
-MAX_TOKENS = 16000
-
-_MEDIA_TYPES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
-
-
-def response_schema() -> dict:
-    """JSON schema for the model's answer (structured-output compatible)."""
-
-    def obj(props: dict, required: list[str] | None = None) -> dict:
-        return {
-            "type": "object",
-            "properties": props,
-            "required": required or list(props),
-            "additionalProperties": False,
-        }
-
-    num, text = {"type": "number"}, {"type": "string"}
-    all_params = sorted({p for defs in FURNITURE_TYPES.values() for p in defs})
-    return obj(
-        {
-            "furniture_type": {"type": "string", "enum": sorted(FURNITURE_TYPES)},
-            "overall": obj({"width": num, "depth": num, "height": num}),
-            "params": {
-                "type": "array",
-                "items": obj(
-                    {
-                        "name": {"type": "string", "enum": all_params},
-                        "value": num,
-                        "source": {"type": "string", "enum": ["drawing", "assumed"]},
-                    }
-                ),
-            },
-            "measurements": {
-                "type": "array",
-                "items": obj({"label": text, "cm": num, "inch": text, "maps_to": text}),
-            },
-            "assumptions": {"type": "array", "items": text},
-            "ambiguities": {"type": "array", "items": text},
-        }
-    )
-
-
-def build_prompt(furniture_type: str | None = None) -> str:
-    lines = [
-        "You read dimensioned IKEA furniture drawings and return a parametric spec.",
-        "",
-        "Units: every number you return in overall and params is in millimetres "
-        "(drawing cm x 10). Measurements keep the drawing's own cm value and the "
-        "inch text exactly as printed (e.g. '27 1/2').",
-        "Axes: width = left-right extent, depth = front-back extent, height = floor to top.",
-        "",
-        "For every dimension printed in the drawing add one measurement whose maps_to "
-        "is the spec path it defines: 'overall.width', 'overall.depth', "
-        "'overall.height' or 'params.<name>'. Do not invent dimensions that are not printed.",
-        "",
-        "Pick furniture_type and return a value for every parameter of that type. "
-        "Use source 'drawing' only if the value is printed in the drawing or follows "
-        "arithmetically from printed values; otherwise use source 'assumed' and give a "
-        "realistic estimate (the listed default unless the drawing suggests otherwise).",
-        "Parameters must make the stated overall dimensions add up.",
-        "",
-        "List each assumption you made in assumptions and every place where the drawing "
-        "can be read more than one way in ambiguities (what the options are and which you chose).",
-        "",
-        "Furniture types and parameters (name: meaning, default mm):",
-    ]
-    for ftype, defs in FURNITURE_TYPES.items():
-        lines.append(f"- {ftype}:")
-        for name, pdef in defs.items():
-            kind = ", integer count" if pdef.integer else ""
-            lines.append(f"    {name}: {pdef.description} (default {pdef.default:g}{kind})")
-    if furniture_type:
-        lines += ["", f"The user says this drawing shows a {furniture_type}."]
-    return "\n".join(lines)
-
-
-def to_spec(answer: dict, name: str, source_image: str) -> dict:
-    """Turn the model's answer into a spec, filling and annotating defaults."""
-    ftype = answer["furniture_type"]
-    defs = FURNITURE_TYPES[ftype]
-    assumptions = list(answer.get("assumptions", []))
-    ambiguities = list(answer.get("ambiguities", []))
-
-    params: dict[str, float] = {}
-    for item in answer.get("params", []):
-        pname, value = item["name"], item["value"]
-        if pname not in defs:
-            ambiguities.append(f"Model returned parameter {pname!r}, not used by {ftype}; dropped.")
-            continue
-        params[pname] = int(value) if defs[pname].integer else value
-        if item.get("source") == "assumed":
-            assumptions.append(f"params.{pname} = {value:g} mm assumed ({defs[pname].description}).")
-    for pname, pdef in defs.items():
-        if pname not in params:
-            params[pname] = int(pdef.default) if pdef.integer else pdef.default
-            assumptions.append(
-                f"params.{pname} = {pdef.default:g} default, not returned by the model."
-            )
-
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "name": name,
-        "furniture_type": ftype,
-        "source_image": source_image,
-        "units": "mm",
-        "overall": answer["overall"],
-        "params": params,
-        "measurements": answer.get("measurements", []),
-        "assumptions": assumptions,
-        "ambiguities": ambiguities,
-    }
+_CM_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*cm", re.IGNORECASE)
+_INCH_RE = re.compile(r"\(([^)]*)")
+# Common OCR confusions inside inch labels.
+_OCR_FIXES = str.maketrans({"s": "8", "S": "8", "l": "1", "I": "1", "O": "0", "o": "0"})
 
 
 class ExtractError(RuntimeError):
     pass
 
 
+@dataclass
+class Label:
+    text: str
+    cm: float
+    inch: str  # normalised inch text, "" if unreadable
+    x: float  # box centre, image pixels
+    y: float
+    vertical: bool
+    score: float
+
+
+def _box_geometry(box) -> tuple[float, float, float, float]:
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    return sum(xs) / len(xs), sum(ys) / len(ys), max(xs) - min(xs), max(ys) - min(ys)
+
+
+def normalise_inch(raw: str, cm: float) -> str:
+    """Turn OCR'd inch text into 'W N/D' if it is plausible for ``cm``, else ''.
+
+    OCR often drops the space between whole inches and the fraction
+    ("173/4") or misreads glyphs. Candidates are generated and the one
+    closest to the cm value wins, if it is within the cm/inch tolerance.
+    """
+    s = raw.translate(_OCR_FIXES).replace('"', "").replace("″", "").strip()
+    # The "½" glyph is often read as "12" or "%2".
+    s = re.sub(r"^(\d+)\s+(?:12|%2)$", r"\1 1/2", s)
+    candidates: list[str] = []
+    m = re.fullmatch(r"(\d+)\s*(\d)\s*/\s*(\d{1,2})", s)
+    if m:
+        whole, num, den = m.groups()
+        candidates.append(f"{whole} {num}/{den}")
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        candidates.append(s)
+    best, best_err = "", None
+    for cand in candidates:
+        try:
+            err = abs(parse_inch(cand) * 25.4 - cm * 10)
+        except ValueError:
+            continue
+        if err <= CM_INCH_TOLERANCE_MM and (best_err is None or err < best_err):
+            best, best_err = cand, err
+    return best
+
+
+def read_labels(image_path: str | Path, engine=None) -> list[Label]:
+    """OCR the drawing and return every text box that carries a cm value.
+
+    Inch text in a separate box (labels split over two lines) is attached to
+    the nearest cm label.
+    """
+    if engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        engine = RapidOCR()
+    result, _ = engine(str(image_path))
+    boxes = []
+    for box, text, score in result or []:
+        x, y, w, h = _box_geometry(box)
+        boxes.append((text, x, y, w, h, float(score)))
+
+    labels: list[Label] = []
+    orphans = []
+    for text, x, y, w, h, score in boxes:
+        m = _CM_RE.search(text)
+        if m:
+            cm = float(m.group(1).replace(",", "."))
+            inch_m = _INCH_RE.search(text[m.end() :])
+            inch = normalise_inch(inch_m.group(1), cm) if inch_m else ""
+            labels.append(Label(text, cm, inch, x, y, h > VERTICAL_ASPECT * w, score))
+        elif _INCH_RE.search(text):
+            orphans.append((text, x, y, max(w, h)))
+
+    for text, x, y, size in orphans:
+        free = [lab for lab in labels if not lab.inch]
+        if not free:
+            break
+        near = min(free, key=lambda lab: (lab.x - x) ** 2 + (lab.y - y) ** 2)
+        if ((near.x - x) ** 2 + (near.y - y) ** 2) ** 0.5 <= size:
+            near.inch = normalise_inch(_INCH_RE.search(text).group(1), near.cm)
+            near.text = f"{near.text} {text}"
+    return labels
+
+
+# --- per-type mapping -------------------------------------------------------
+# Each rule returns {spec path: Label} plus notes for the ambiguities list.
+
+Mapping = dict[str, Label]
+
+
+def _split(labels: list[Label]) -> tuple[list[Label], list[Label]]:
+    horizontal = sorted((lab for lab in labels if not lab.vertical), key=lambda lab: -lab.cm)
+    vertical = sorted((lab for lab in labels if lab.vertical), key=lambda lab: -lab.cm)
+    return horizontal, vertical
+
+
+def _assign(paths: list[str], labels: list[Label], mapping: Mapping) -> list[Label]:
+    for path, lab in zip(paths, labels):
+        mapping[path] = lab
+    return labels[len(paths) :]
+
+
+def map_cabinet(labels: list[Label]) -> tuple[Mapping, list[str]]:
+    """Front + side view: the vertical label is the height; of the horizontal
+    labels the largest is the width, the next the depth."""
+    horizontal, vertical = _split(labels)
+    mapping: Mapping = {}
+    rest = _assign(["overall.width", "overall.depth"], horizontal, mapping)
+    rest += _assign(["overall.height"], vertical, mapping)
+    return mapping, [
+        "Mapping rule: vertical label = height, largest horizontal = width, next = depth."
+    ] + _unused(rest)
+
+
+def map_coffee_table(labels: list[Label]) -> tuple[Mapping, list[str]]:
+    """Perspective view: horizontal labels are length (largest) and width.
+    The largest vertical label is the height; the other two are the shelf
+    chain, upper one = tabletop underside to shelf, lower one = floor to shelf."""
+    horizontal, vertical = _split(labels)
+    mapping: Mapping = {}
+    rest = _assign(["overall.width", "overall.depth"], horizontal, mapping)
+    rest += _assign(["overall.height"], vertical, mapping)
+    chain = sorted(vertical[1:3], key=lambda lab: lab.y)  # top of image first
+    rest += _assign(
+        ["params.shelf_clearance_below_top", "params.shelf_height"], chain, mapping
+    )
+    rest += vertical[3:]
+    return mapping, [
+        "Mapping rule: largest horizontal = length, next = width; largest vertical = height; "
+        "of the other vertical labels the upper = tabletop underside to shelf, "
+        "the lower = floor to shelf underside."
+    ] + _unused(rest)
+
+
+def map_bench(labels: list[Label]) -> tuple[Mapping, list[str]]:
+    """Horizontal labels by size: overall width > seat width > depth > seat
+    depth. Vertical labels: overall height > seat height."""
+    horizontal, vertical = _split(labels)
+    mapping: Mapping = {}
+    rest = _assign(
+        ["overall.width", "params.seat_width", "overall.depth", "params.seat_depth"],
+        horizontal,
+        mapping,
+    )
+    rest += _assign(["overall.height", "params.seat_height"], vertical, mapping)
+    return mapping, [
+        "Mapping rule: horizontal labels by size = overall width, seat width, depth, seat depth; "
+        "vertical labels by size = height, seat height."
+    ] + _unused(rest)
+
+
+def _unused(labels: list[Label]) -> list[str]:
+    return [f"OCR label {lab.text!r} ({lab.cm:g} cm) was not mapped to any field." for lab in labels]
+
+
+MAPPERS = {"cabinet": map_cabinet, "coffee_table": map_coffee_table, "bench": map_bench}
+
+
+def derive_params(ftype: str, overall: dict, params: dict, assumptions: list[str]) -> None:
+    """Fill params that follow arithmetically from read values and defaults."""
+    if ftype == "coffee_table" and {"shelf_clearance_below_top", "shelf_height"} <= params.keys():
+        top = (
+            overall.get("height", 0)
+            - params["shelf_clearance_below_top"]
+            - params["shelf_height"]
+            - params["shelf_thickness"]
+        )
+        if top > 0:
+            params["top_thickness"] = top
+            assumptions.append(
+                f"params.top_thickness = {top:g} derived: height - shelf_clearance_below_top"
+                " - shelf_height - shelf_thickness."
+            )
+
+
+def to_spec(
+    labels: list[Label], furniture_type: str, name: str, source_image: str
+) -> dict:
+    """Map OCR labels to a spec; unmapped values get defaults and are documented."""
+    if furniture_type not in MAPPERS:
+        raise ExtractError(f"unknown furniture type {furniture_type!r}")
+    mapping, ambiguities = MAPPERS[furniture_type](labels)
+    defs = FURNITURE_TYPES[furniture_type]
+    assumptions: list[str] = []
+
+    overall: dict = {}
+    params: dict = {}
+    measurements = []
+    for path, lab in mapping.items():
+        section, key = path.split(".")
+        (overall if section == "overall" else params)[key] = lab.cm * 10
+        measurements.append({"label": lab.text, "cm": lab.cm, "inch": lab.inch, "maps_to": path})
+        if not lab.inch:
+            ambiguities.append(f"Inch value of {lab.text!r} unreadable; cm/inch cross-check skipped.")
+
+    for key in ("width", "depth", "height"):
+        if key not in overall:
+            ambiguities.append(f"overall.{key} not found in the drawing; set it by hand.")
+            overall[key] = 0
+
+    defaulted = []
+    for pname, pdef in defs.items():
+        if pname not in params:
+            params[pname] = int(pdef.default) if pdef.integer else pdef.default
+            defaulted.append(pname)
+    derive_params(furniture_type, overall, params, assumptions)
+    for pname in defaulted:
+        if not any(a.startswith(f"params.{pname} ") for a in assumptions):
+            assumptions.append(
+                f"params.{pname} = {params[pname]:g} default ({defs[pname].description}); "
+                "not dimensioned in the drawing."
+            )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "name": name,
+        "furniture_type": furniture_type,
+        "source_image": source_image,
+        "units": "mm",
+        "overall": overall,
+        "params": params,
+        "measurements": measurements,
+        "assumptions": assumptions,
+        "ambiguities": ambiguities,
+    }
+
+
 def extract(
     image_path: str | Path,
     *,
+    furniture_type: str,
     name: str | None = None,
-    furniture_type: str | None = None,
-    model: str | None = None,
-    client: anthropic.Anthropic | None = None,
+    engine=None,
 ) -> dict:
-    """Ask Claude for the dimensions in ``image_path``. Returns an unvalidated spec."""
+    """Read ``image_path`` locally and return an unvalidated spec."""
     image_path = Path(image_path)
-    media_type = _MEDIA_TYPES.get(image_path.suffix.lower())
-    if media_type is None:
-        raise ExtractError(f"unsupported image type {image_path.suffix!r}")
-    data = base64.standard_b64encode(image_path.read_bytes()).decode("ascii")
-
-    client = client or anthropic.Anthropic()
-    response = client.messages.create(
-        model=model or os.environ.get("CLAUDE_MODEL") or DEFAULT_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=build_prompt(furniture_type),
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": data},
-                    },
-                    {"type": "text", "text": "Extract the spec for this drawing."},
-                ],
-            }
-        ],
-        output_config={"format": {"type": "json_schema", "schema": response_schema()}},
-    )
-    if response.stop_reason == "refusal":
-        raise ExtractError("the model declined the request")
-    if response.stop_reason == "max_tokens":
-        raise ExtractError("the model's answer was cut off at max_tokens")
-    text = next((b.text for b in response.content if b.type == "text"), None)
-    if text is None:
-        raise ExtractError("the model returned no text block")
-    try:
-        answer = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ExtractError(f"the model returned invalid JSON: {e}") from e
-
-    if furniture_type and answer.get("furniture_type") != furniture_type:
-        answer["ambiguities"] = [
-            *answer.get("ambiguities", []),
-            f"Model classified the drawing as {answer.get('furniture_type')!r}; "
-            f"overridden to {furniture_type!r} as requested.",
-        ]
-        answer["furniture_type"] = furniture_type
-    return to_spec(answer, name or image_path.stem, str(image_path))
+    if not image_path.is_file():
+        raise ExtractError(f"image not found: {image_path}")
+    labels = read_labels(image_path, engine)
+    if not labels:
+        raise ExtractError("no 'NN cm' labels found in the drawing")
+    return to_spec(labels, furniture_type, name or image_path.stem, str(image_path))

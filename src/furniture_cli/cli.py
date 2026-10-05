@@ -18,8 +18,6 @@ def _err(msg: str) -> None:
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
-    import anthropic
-
     from .extract import ExtractError, extract
 
     image = Path(args.image)
@@ -28,8 +26,8 @@ def cmd_extract(args: argparse.Namespace) -> int:
         return 2
     spec_path = Path(args.spec or Path(DEFAULT_SPEC_DIR) / f"{args.name or image.stem}.json")
     try:
-        spec = extract(image, name=args.name, furniture_type=args.type, model=args.model)
-    except (ExtractError, anthropic.APIError) as e:
+        spec = extract(image, name=args.name, furniture_type=args.type)
+    except ExtractError as e:
         _err(f"extract failed: {e}")
         return 1
     # Write even an invalid spec so it can be corrected by hand.
@@ -93,15 +91,16 @@ def make_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def extract_args(p: argparse.ArgumentParser, spec_flag: str) -> None:
-        p.add_argument("image", help="drawing (PNG/JPEG/WebP)")
-        p.add_argument(spec_flag, "-s", dest="spec", help="spec path (default specs/<name>.json)")
+    def extract_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("image", help="drawing (PNG/JPEG)")
+        p.add_argument("--spec", "-s", dest="spec", help="spec path (default specs/<name>.json)")
         p.add_argument("--name", help="spec name (default: image file stem)")
-        p.add_argument("--type", choices=sorted(FURNITURE_TYPES), help="force furniture type")
-        p.add_argument("--model", help="Claude model (default: $CLAUDE_MODEL or claude-sonnet-5-5)")
+        p.add_argument(
+            "--type", required=True, choices=sorted(FURNITURE_TYPES), help="furniture type"
+        )
 
-    p = sub.add_parser("extract", help="read dimensions from a drawing into a spec")
-    extract_args(p, "--spec")
+    p = sub.add_parser("extract", help="read dimensions from a drawing into a spec (local OCR)")
+    extract_args(p)
     p.set_defaults(func=cmd_extract)
 
     for name, func, help_ in (
@@ -114,7 +113,7 @@ def make_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=func)
 
     p = sub.add_parser("all", help="extract, build and validate in one go")
-    extract_args(p, "--spec")
+    extract_args(p)
     p.add_argument("--out", "-o", default=DEFAULT_OUT, help="output root (default: out)")
     p.set_defaults(func=cmd_all)
     return parser
