@@ -5,7 +5,7 @@ description = "Turn dimensioned IKEA furniture drawings into parametric STEP/STL
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "anthropic>=0.70",
+    "rapidocr-onnxruntime>=1.4.4",
     "build123d>=0.9",
 ]
 

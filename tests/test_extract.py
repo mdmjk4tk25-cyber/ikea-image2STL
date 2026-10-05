@@ -1,108 +1,187 @@
 import json
-from types import SimpleNamespace
 
-from conftest import DRAWING_DIR, load
+import pytest
+from conftest import DRAWING_DIR, FIXTURES, TYPES, load
 
 from furniture_cli import cli
-from furniture_cli.extract import build_prompt, extract, response_schema
+from furniture_cli.extract import (
+    ExtractError,
+    Label,
+    extract,
+    merge_passes,
+    normalise_inch,
+    read_labels,
+)
 from furniture_cli.spec import validate_spec
 
 
-def answer_from_spec(spec: dict) -> dict:
-    """What a perfect model answer for a fixture looks like."""
+@pytest.fixture(scope="module")
+def ocr_specs():
+    """Run the real local OCR once per drawing."""
     return {
-        "furniture_type": spec["furniture_type"],
-        "overall": spec["overall"],
-        "params": [
-            {"name": k, "value": v, "source": "assumed"} for k, v in spec["params"].items()
-        ],
-        "measurements": spec["measurements"],
-        "assumptions": ["a"],
-        "ambiguities": [],
+        name: extract(DRAWING_DIR / f"{name}.png", furniture_type=TYPES[name])
+        for name in FIXTURES
     }
 
 
-class FakeClient:
-    def __init__(self, answer: dict, stop_reason: str = "end_turn"):
-        self.answer, self.stop_reason, self.calls = answer, stop_reason, []
-        self.messages = self
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        block = SimpleNamespace(type="text", text=json.dumps(self.answer))
-        return SimpleNamespace(stop_reason=self.stop_reason, content=[block])
+@pytest.mark.parametrize("name", FIXTURES)
+def test_ocr_reads_every_drawing_dimension(name, ocr_specs):
+    """Accuracy check: every dimension in the hand-checked spec is found and
+    mapped to the same field with the same value."""
+    reference = {m["maps_to"]: m["cm"] for m in load(name)["measurements"]}
+    extracted = {m["maps_to"]: m["cm"] for m in ocr_specs[name]["measurements"]}
+    assert extracted == reference
 
 
-def _walk_objects(schema):
-    if isinstance(schema, dict):
-        if schema.get("type") == "object":
-            yield schema
-        for v in schema.values():
-            yield from _walk_objects(v)
-
-
-def test_schema_is_structured_output_compatible():
-    for obj in _walk_objects(response_schema()):
-        assert obj["additionalProperties"] is False
-        assert set(obj["required"]) == set(obj["properties"])
-
-
-def test_prompt_lists_every_parameter():
-    prompt = build_prompt()
-    assert "shelf_clearance_below_top" in prompt and "seat_depth" in prompt
-
-
-def test_extract_with_fake_client_yields_valid_spec():
-    reference = load("couchtisch")
-    client = FakeClient(answer_from_spec(reference))
-    spec = extract(DRAWING_DIR / "couchtisch.png", client=client, model="test-model")
+@pytest.mark.parametrize("name", FIXTURES)
+def test_ocr_spec_is_valid_and_matches_reference(name, ocr_specs):
+    spec = ocr_specs[name]
     validate_spec(spec)
+    reference = load(name)
+    assert spec["overall"] == reference["overall"]
     assert spec["params"] == reference["params"]
-    req = client.calls[0]
-    assert req["model"] == "test-model"
-    assert req["messages"][0]["content"][0]["source"]["media_type"] == "image/png"
-    assert req["output_config"]["format"]["type"] == "json_schema"
 
 
-def test_missing_params_get_defaults_and_are_documented():
-    answer = answer_from_spec(load("schrank"))
-    answer["params"] = [p for p in answer["params"] if p["name"] != "door_gap"]
-    spec = extract(DRAWING_DIR / "schrank.png", client=FakeClient(answer))
-    assert spec["params"]["door_gap"] == 3
-    assert any("door_gap" in a for a in spec["assumptions"])
+@pytest.mark.parametrize(
+    "raw,cm,expected",
+    [
+        ('27 1/2"', 70, "27 1/2"),
+        ('133/4"', 35, "13 3/4"),  # missing space
+        ('21 5/s"', 55, "21 5/8"),  # s read for 8
+        ('40 12"', 103, "40 1/2"),  # ½ read as 12
+        ('44 %2"', 113, "44 1/2"),
+        ('16 1%"', 41, ""),  # unreadable fraction
+        ('72 1/2"', 70, ""),  # disagrees with cm
+    ],
+)
+def test_normalise_inch(raw, cm, expected):
+    assert normalise_inch(raw, cm) == expected
 
 
-def test_type_override_is_recorded():
-    answer = answer_from_spec(load("bank"))
-    answer["furniture_type"] = "cabinet"
-    spec = extract(DRAWING_DIR / "bank.png", client=FakeClient(answer), furniture_type="bench")
-    assert spec["furniture_type"] == "bench"
-    assert any("overridden" in a for a in spec["ambiguities"])
+def _blank_png(path):
+    import cv2
+    import numpy as np
+
+    cv2.imwrite(str(path), np.full((800, 1400, 3), 255, dtype=np.uint8))
+    return path
 
 
-def test_cli_all_runs_offline(tmp_path, monkeypatch, capsys):
-    answer = answer_from_spec(load("schrank"))
+def _engine(*items):
+    """Fake OCR engine: items are (text, x, y, w, h)."""
 
-    def fake_extract(image, **kw):
-        return extract(image, client=FakeClient(answer), **kw)
+    def run(_path):
+        result = []
+        for text, x, y, w, h in items:
+            box = [[x - w / 2, y - h / 2], [x + w / 2, y - h / 2], [x + w / 2, y + h / 2], [x - w / 2, y + h / 2]]
+            result.append((box, text, 0.9))
+        return result, None
 
-    monkeypatch.setattr("furniture_cli.extract.extract", fake_extract)
+    return run
+
+
+def test_split_inch_label_is_attached_to_nearest_cm_label(tmp_path):
+    engine = _engine(("19 cm", 100, 100, 40, 130), ('(7 1/2")', 140, 100, 45, 130))
+    (label,) = read_labels(_blank_png(tmp_path / "x.png"), engine, scales=(1.0,))
+    assert label.cm == 19 and label.inch == "7 1/2" and label.vertical
+
+
+def test_coffee_table_shelf_chain_uses_position(tmp_path):
+    img = _blank_png(tmp_path / "t.png")
+    engine = _engine(
+        ("90 cm", 400, 100, 300, 50),
+        ("55 cm", 900, 100, 300, 50),
+        ("45 cm", 50, 500, 40, 300),
+        ("20 cm", 1300, 300, 40, 130),  # upper: tabletop underside to shelf
+        ("19 cm", 1300, 600, 40, 130),  # lower: floor to shelf
+    )
+    spec = extract(img, furniture_type="coffee_table", engine=engine, scales=(1.0,))
+    assert spec["params"]["shelf_clearance_below_top"] == 200
+    assert spec["params"]["shelf_height"] == 190
+    assert spec["params"]["top_thickness"] == 50  # 450 - 200 - 190 - 10
+    validate_spec(spec)
+
+
+def test_missing_dimension_is_reported(tmp_path):
+    img = _blank_png(tmp_path / "c.png")
+    engine = _engine(("70 cm", 400, 50, 300, 40), ("70 cm", 50, 400, 40, 300))
+    spec = extract(img, furniture_type="cabinet", engine=engine, scales=(1.0,))
+    assert spec["overall"]["depth"] == 0
+    assert any("overall.depth not found" in a for a in spec["ambiguities"])
+
+
+def test_no_labels_is_an_error(tmp_path):
+    img = _blank_png(tmp_path / "e.png")
+    with pytest.raises(ExtractError):
+        extract(img, furniture_type="bench", engine=_engine(("hello", 1, 1, 10, 10)), scales=(1.0,))
+
+
+def test_cli_all_runs_locally(tmp_path, capsys):
     spec_path = tmp_path / "s.json"
     rc = cli.main(
-        ["all", str(DRAWING_DIR / "schrank.png"), "--spec", str(spec_path), "--out", str(tmp_path)]
+        [
+            "all",
+            str(DRAWING_DIR / "schrank.png"),
+            "--type",
+            "cabinet",
+            "--spec",
+            str(spec_path),
+            "--out",
+            str(tmp_path),
+        ]
     )
     assert rc == 0, capsys.readouterr().err
-    assert json.loads(spec_path.read_text())["furniture_type"] == "cabinet"
+    assert json.loads(spec_path.read_text())["overall"]["width"] == 700
 
 
 def test_cli_extract_keeps_invalid_spec_for_hand_editing(tmp_path, monkeypatch):
-    answer = answer_from_spec(load("schrank"))
-    answer["overall"]["width"] = 720  # disagrees with the 70 cm measurement
-
-    monkeypatch.setattr(
-        "furniture_cli.extract.extract",
-        lambda image, **kw: extract(image, client=FakeClient(answer), **kw),
-    )
+    engine = _engine(("70 cm", 400, 50, 300, 40))  # width only
+    monkeypatch.setattr("furniture_cli.extract.make_engine", lambda threads=None: engine)
     spec_path = tmp_path / "s.json"
-    rc = cli.main(["extract", str(DRAWING_DIR / "schrank.png"), "--spec", str(spec_path)])
+    rc = cli.main(
+        [
+            "extract", str(DRAWING_DIR / "schrank.png"), "--type", "cabinet",
+            "--spec", str(spec_path), "--ocr-scales", "1",
+        ]
+    )
     assert rc == 1 and spec_path.exists()
+
+
+def _label(cm, x, inch="", score=0.9):
+    return Label(f"{cm:g} cm", cm, inch, x, 100, False, score)
+
+
+def test_merge_passes_votes_on_cm_and_fills_inch():
+    passes = [
+        [_label(103, 500), _label(58, 900)],
+        [_label(403, 502, score=0.95), _label(58, 901, inch="22 7/8")],  # misread
+        [_label(103, 499, inch="40 1/2")],
+    ]
+    merged = sorted(merge_passes(passes, diagonal=2000), key=lambda lab: lab.x)
+    assert [(lab.cm, lab.inch) for lab in merged] == [(103, "40 1/2"), (58, "22 7/8")]
+
+
+def test_spec_option_is_single_image_only(tmp_path):
+    images = [str(DRAWING_DIR / "schrank.png")] * 2
+    rc = cli.main(["extract", *images, "--type", "cabinet", "--spec", str(tmp_path / "x.json")])
+    assert rc == 2
+
+
+def test_extract_many_images_in_parallel(tmp_path, monkeypatch):
+    import shutil
+
+    for n in ("a", "b"):
+        shutil.copy(DRAWING_DIR / "schrank.png", tmp_path / f"{n}.png")
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["all", "a.png", "b.png", "--type", "cabinet", "--ocr-scales", "1", "-j", "2"])
+    assert rc == 0
+    for n in ("a", "b"):
+        assert json.loads((tmp_path / "specs" / f"{n}.json").read_text())["overall"]["width"] == 700
+        assert (tmp_path / "out" / n / "validation.json").exists()
+
+
+def test_parallel_build_and_validate(tmp_path, capsys):
+    specs = [f"specs/{n}.json" for n in FIXTURES]
+    assert cli.main(["build", *specs, "--out", str(tmp_path), "-j", "3"]) == 0
+    assert cli.main(["validate", *specs, "--out", str(tmp_path), "-j", "3"]) == 0
+    out = capsys.readouterr().out
+    assert all(f"OK: {n}" in out for n in FIXTURES)
