@@ -22,10 +22,12 @@ Alles läuft lokal. Netzwerk wird nur für `uv sync` (PyPI) gebraucht, zur Laufz
 
 | Befehl | Was passiert |
 |---|---|
-| `furniture extract BILD --type TYP [--spec PFAD]` | Lokale OCR liest die Maße, eine Regel je Möbeltyp ordnet sie den Spec-Feldern zu, Ergebnis `specs/<bildname>.json`. `TYP` ist `cabinet`, `coffee_table` oder `bench`. Ist die Spec ungültig, wird sie trotzdem geschrieben, Exit-Code 1 und Fehlerliste zum Korrigieren. |
-| `furniture build SPEC [--out out]` | Validiert die Spec, baut die Teile und schreibt `out/<name>/<name>.step`, `<name>.stl` und `parts/<teil>.step/.stl`. |
-| `furniture validate SPEC [--out out]` | Prüft die exportierten Dateien, schreibt `out/<name>/validation.json`, Exit-Code 1 bei Fehlern. |
-| `furniture all BILD [...]` | `extract`, `build`, `validate` hintereinander. Stoppt, wenn die extrahierte Spec ungültig ist. |
+| `furniture extract BILD... --type TYP [--spec PFAD] [--ocr-scales 1,2,3]` | Lokale OCR liest die Maße, eine Regel je Möbeltyp ordnet sie den Spec-Feldern zu, Ergebnis `specs/<bildname>.json`. `TYP` ist `cabinet`, `coffee_table` oder `bench`. Ist die Spec ungültig, wird sie trotzdem geschrieben, Exit-Code 1 und Fehlerliste zum Korrigieren. |
+| `furniture build SPEC... [--out out]` | Validiert die Spec, baut die Teile und schreibt `out/<name>/<name>.step`, `<name>.stl` und `parts/<teil>.step/.stl`. |
+| `furniture validate SPEC... [--out out]` | Prüft die exportierten Dateien, schreibt `out/<name>/validation.json`, Exit-Code 1 bei Fehlern. |
+| `furniture all BILD... --type TYP [...]` | `extract`, `build`, `validate` hintereinander. Stoppt, wenn die extrahierte Spec ungültig ist. |
+
+Alle Befehle nehmen mehrere Eingaben und verarbeiten sie parallel (`--jobs N`, Default: ein Prozess je logischem Kern, höchstens so viele wie Eingaben). `--spec` und `--name` gehen nur mit einem Bild; bei mehreren landet jede Spec unter `specs/<bildname>.json`.
 
 Empfohlener Ablauf: `extract`, Spec von Hand prüfen und korrigieren, dann `build` und `validate`.
 
@@ -91,17 +93,31 @@ Zoll-Angaben dienen nur der Gegenprüfung. OCR liest Brüche oft falsch („½�
 | Zeichnung | cm-Maße gelesen | richtig zugeordnet | Zoll lesbar |
 |---|---|---|---|
 | Schrank | 3/3 | 3/3 | 3/3 |
-| Couchtisch | 5/5 | 5/5 | 4/5 |
+| Couchtisch | 5/5 | 5/5 | 5/5 |
 | Bank | 6/6 | 6/6 | 2/6 |
-| **Summe** | **14/14** | **14/14** | **9/14** |
+| **Summe** | **14/14** | **14/14** | **10/14** |
 
-Die erzeugten Specs sind identisch mit den Hand-Specs in `specs/` (Gesamtmaße und Parameter). Bei den Parametern liegt das daran, dass die Hand-Specs dieselben Defaults verwenden; gelesen werden nur die bemaßten Werte. Laufzeit: etwa 1 s pro Zeichnung auf CPU.
+Die erzeugten Specs sind identisch mit den Hand-Specs in `specs/` (Gesamtmaße und Parameter). Bei den Parametern liegt das daran, dass die Hand-Specs dieselben Defaults verwenden; gelesen werden nur die bemaßten Werte. Mit nur einem OCR-Durchgang (`--ocr-scales 1`) sind es 9/14 Zoll-Werte bei gleichen cm-Werten.
 
 Grenzen: Die Zuordnungsregeln sind auf das Layout dieser IKEA-Zeichnungen zugeschnitten (Wertrangfolge, Ausrichtung, Position). Bei anderen Layouts kann eine Zuordnung falsch sein; die Validierung fängt das nur ab, wenn die Werte geometrisch nicht zusammenpassen. Deshalb die Spec vor `build` prüfen.
 
 Verworfene Alternativen:
 - **Tesseract 5.3:** las auf denselben Zeichnungen nur 4 von 14 cm-Maßen richtig (2 weitere falsch, z. B. `403` statt `103`); gedrehte und schräge Beschriftungen fehlten.
 - **Lokales Vision-Sprachmodell (z. B. über Ollama):** mehrere GB Modell, auf CPU langsam und nicht deterministisch. Die OCR liest hier schon alle Maße; das Schwierige ist die Zuordnung, und die ist mit Regeln nachvollziehbar und testbar.
+
+## Hardware und Leistung
+
+Zielsystem: Framework Desktop, AMD Ryzen AI Max+ 395 (16 Kerne, 32 Threads, Radeon 8060S, NPU), 128 GB RAM, Windows x64.
+
+- **Windows:** Alle Abhängigkeiten haben Wheels für `win_amd64` / CPython 3.12 (in `uv.lock` geprüft: `cadquery-ocp-novtk`, `onnxruntime`, `opencv-python`, `numpy`). Der libGL-Hinweis oben betrifft nur Linux. Bilder werden über `np.fromfile` gelesen, damit Pfade mit Umlauten unter Windows funktionieren.
+- **Mehrere Kerne:** `--jobs` startet Worker-Prozesse mit `spawn` (unter Windows ohnehin die einzige Methode; `fork` neben ONNX-Runtime- und OCCT-Threads kann hängen). Bei `extract` teilen sich die Worker die Kerne: jeder ONNX-Runtime-Prozess bekommt `logische Kerne / Jobs` Threads, damit 32 Threads nicht 32-fach überbucht werden.
+- **Rechenreserve für Genauigkeit:** Standardmäßig läuft die OCR dreimal (1×, 2×, 3× hochskaliert), die Ergebnisse werden per Mehrheitsentscheid zusammengeführt. Das kostet etwa die dreifache OCR-Zeit und bringt hier einen zusätzlichen Zoll-Wert (10 statt 9 von 14); die cm-Werte sind in beiden Fällen 14/14. `--ocr-scales 1` schaltet das ab.
+- **Gemessen** (Linux-Container mit 4 Kernen, nicht auf dem Zielsystem): 8 Zeichnungen `extract` seriell 21,9 s, mit `-j 4` 15,4 s. ONNX Runtime nutzt schon im Einzelprozess mehrere Threads, deshalb skaliert es nicht linear. Auf dem Zielsystem wurde nichts gemessen.
+
+Bewusst nicht genutzt:
+- **GPU (Radeon 8060S über DirectML):** bräuchte `onnxruntime-directml` statt `onnxruntime` (beide liefern dasselbe Python-Modul, also nicht gleichzeitig installierbar) und ist hier nicht testbar. Die OCR-Modelle sind klein; Kopieren zur GPU frisst den Gewinn bei einzelnen Bildern weitgehend auf.
+- **NPU (XDNA 2):** braucht die Ryzen-AI-Software und quantisierte Modelle; viel Aufwand bei ohnehin kurzer CPU-Laufzeit.
+- **128 GB RAM:** Das Programm braucht pro Prozess wenige hundert MB; Speicher begrenzt hier nichts.
 
 ## Referenzzeichnungen und Annahmen
 

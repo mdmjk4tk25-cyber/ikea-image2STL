@@ -57,7 +57,7 @@ def normalise_inch(raw: str, cm: float) -> str:
     """
     s = raw.translate(_OCR_FIXES).replace('"', "").replace("″", "").strip()
     # The "½" glyph is often read as "12" or "%2".
-    s = re.sub(r"^(\d+)\s+(?:12|%2)$", r"\1 1/2", s)
+    s = re.sub(r"^(\d+)\s+(?:12|%2|1%2|V2|1V2|1V/2)$", r"\1 1/2", s)
     candidates: list[str] = []
     m = re.fullmatch(r"(\d+)\s*(\d)\s*/\s*(\d{1,2})", s)
     if m:
@@ -76,34 +76,60 @@ def normalise_inch(raw: str, cm: float) -> str:
     return best
 
 
-def read_labels(image_path: str | Path, engine=None) -> list[Label]:
-    """OCR the drawing and return every text box that carries a cm value.
+# OCR passes at these upscale factors are merged. Upscaling gives the text
+# recogniser more pixels per glyph, which mainly helps the small inch
+# fractions; the detector input size is capped by RapidOCR, so each extra
+# pass costs well under a second on a desktop CPU.
+DEFAULT_SCALES: tuple[float, ...] = (1.0, 2.0, 3.0)
+# Labels from different passes within this fraction of the image diagonal
+# are treated as the same label.
+MERGE_DISTANCE = 0.03
 
-    Inch text in a separate box (labels split over two lines) is attached to
-    the nearest cm label.
-    """
-    if engine is None:
+_ENGINES: dict[int, object] = {}
+
+
+def make_engine(threads: int | None = None):
+    """RapidOCR engine, cached per process. ``threads`` caps ONNX Runtime's
+    intra-op threads (None: let ONNX Runtime use all cores)."""
+    key = threads or 0
+    if key not in _ENGINES:
         from rapidocr_onnxruntime import RapidOCR
 
-        engine = RapidOCR()
-    result, _ = engine(str(image_path))
-    boxes = []
-    for box, text, score in result or []:
-        x, y, w, h = _box_geometry(box)
-        boxes.append((text, x, y, w, h, float(score)))
+        kwargs = {}
+        if threads:
+            kwargs = {"intra_op_num_threads": threads, "inter_op_num_threads": 1}
+        _ENGINES[key] = RapidOCR(**kwargs)
+    return _ENGINES[key]
 
+
+def load_image(image_path: str | Path):
+    """Read an image with OpenCV; np.fromfile also handles non-ASCII Windows paths."""
+    import cv2
+    import numpy as np
+
+    data = np.fromfile(str(image_path), dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+    if img is None:
+        raise ExtractError(f"cannot read image {image_path}")
+    return img
+
+
+def _labels_from_ocr(result, scale: float) -> list[Label]:
+    """cm labels from one OCR pass, in original-image coordinates."""
     labels: list[Label] = []
     orphans = []
-    for text, x, y, w, h, score in boxes:
+    for box, text, score in result or []:
+        x, y, w, h = (v / scale for v in _box_geometry(box))
         m = _CM_RE.search(text)
         if m:
             cm = float(m.group(1).replace(",", "."))
             inch_m = _INCH_RE.search(text[m.end() :])
             inch = normalise_inch(inch_m.group(1), cm) if inch_m else ""
-            labels.append(Label(text, cm, inch, x, y, h > VERTICAL_ASPECT * w, score))
+            labels.append(Label(text, cm, inch, x, y, h > VERTICAL_ASPECT * w, float(score)))
         elif _INCH_RE.search(text):
             orphans.append((text, x, y, max(w, h)))
 
+    # Inch text in its own box (two-line labels) goes to the nearest cm label.
     for text, x, y, size in orphans:
         free = [lab for lab in labels if not lab.inch]
         if not free:
@@ -113,6 +139,62 @@ def read_labels(image_path: str | Path, engine=None) -> list[Label]:
             near.inch = normalise_inch(_INCH_RE.search(text).group(1), near.cm)
             near.text = f"{near.text} {text}"
     return labels
+
+
+def merge_passes(passes: list[list[Label]], diagonal: float) -> list[Label]:
+    """Combine labels from several OCR passes.
+
+    Labels at the same place form a cluster. The cm value is decided by
+    majority vote (ties: higher summed confidence), the inch text is the
+    most frequent readable one among the winners.
+    """
+    limit = MERGE_DISTANCE * diagonal
+    clusters: list[list[Label]] = []
+    for labels in passes:
+        for lab in labels:
+            for cluster in clusters:
+                ref = cluster[0]
+                if ref.vertical == lab.vertical and (
+                    (ref.x - lab.x) ** 2 + (ref.y - lab.y) ** 2
+                ) ** 0.5 <= limit:
+                    cluster.append(lab)
+                    break
+            else:
+                clusters.append([lab])
+
+    merged = []
+    for cluster in clusters:
+        votes: dict[float, list[Label]] = {}
+        for lab in cluster:
+            votes.setdefault(lab.cm, []).append(lab)
+        winners = max(votes.values(), key=lambda ls: (len(ls), sum(lab.score for lab in ls)))
+        best = max(winners, key=lambda lab: lab.score)
+        inches = [lab.inch for lab in winners if lab.inch]
+        inch = max(set(inches), key=inches.count) if inches else ""
+        text = next((lab.text for lab in winners if lab.inch == inch), best.text)
+        merged.append(Label(text, best.cm, inch, best.x, best.y, best.vertical, best.score))
+    return merged
+
+
+def read_labels(
+    image_path: str | Path,
+    engine=None,
+    scales: tuple[float, ...] = DEFAULT_SCALES,
+) -> list[Label]:
+    """OCR the drawing at each scale and return the merged cm labels."""
+    import cv2
+
+    engine = engine or make_engine()
+    img = load_image(image_path)
+    passes = []
+    for scale in scales:
+        scaled = img if scale == 1 else cv2.resize(
+            img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
+        result, _ = engine(scaled)
+        passes.append(_labels_from_ocr(result, scale))
+    h, w = img.shape[:2]
+    return merge_passes(passes, (h * h + w * w) ** 0.5)
 
 
 # --- per-type mapping -------------------------------------------------------
@@ -264,12 +346,13 @@ def extract(
     furniture_type: str,
     name: str | None = None,
     engine=None,
+    scales: tuple[float, ...] = DEFAULT_SCALES,
 ) -> dict:
     """Read ``image_path`` locally and return an unvalidated spec."""
     image_path = Path(image_path)
     if not image_path.is_file():
         raise ExtractError(f"image not found: {image_path}")
-    labels = read_labels(image_path, engine)
+    labels = read_labels(image_path, engine, scales)
     if not labels:
         raise ExtractError("no 'NN cm' labels found in the drawing")
     return to_spec(labels, furniture_type, name or image_path.stem, str(image_path))

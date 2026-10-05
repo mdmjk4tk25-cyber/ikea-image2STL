@@ -16,9 +16,9 @@ Python CLI (uv, Python 3.12, build123d) that turns dimensioned IKEA drawings (PN
 | Item | State |
 |---|---|
 | Code | All four stages on `main` (PR #1, merged 2026-10-04); local-only extract on branch `claude/furniture-cli-initial-vroskm` (PR #2) |
-| Tests | 53 passing (`uv run pytest`), also with networking disabled (`unshare -n`) |
+| Tests | 57 passing (`uv run pytest`), also with networking disabled (`unshare -n`) |
 | End-to-end | `build` + `validate` pass for all three reference specs |
-| `extract` | Runs locally on all three drawings: 14/14 cm values read and mapped correctly, 9/14 inch values readable |
+| `extract` | Runs locally on all three drawings: 14/14 cm values read and mapped correctly, 10/14 inch values readable |
 | CI | None configured in the repo |
 
 Verified dimensions (STEP and STL bounding box, exact match):
@@ -56,6 +56,16 @@ Sebastian asked that everything runs locally. Changes:
 - Tesseract 5.3 was tried first and read only 4/14 cm values correctly. A local vision-language model (Ollama) was rejected: multi-GB, slow on CPU, nondeterministic, and OCR already reads every value.
 - Limitation: the mapping rules fit these IKEA layouts; other layouts may need rule changes or hand correction of the spec.
 
+## 2026-10-05: tuning for the target machine
+
+Target: Framework Desktop, Ryzen AI Max+ 395 (16C/32T), Radeon 8060S, 128 GB, Windows x64.
+
+- Verified `uv.lock` has `win_amd64` cp312 wheels for OCP, onnxruntime, opencv, numpy.
+- All commands take multiple inputs and run them in parallel (`--jobs`, default one per logical CPU). Pool uses `spawn` (Windows-compatible; `fork` deadlocked next to ONNX Runtime/OCCT threads in a test run). OCR workers get `cpu_count / jobs` ONNX threads.
+- Multi-scale OCR (1x, 2x, 3x, majority vote) is the default: inch 10/14 instead of 9/14, about 3x OCR time. `--ocr-scales 1` for speed.
+- Images read via `np.fromfile` + `cv2.imdecode` for non-ASCII Windows paths.
+- Not done: DirectML GPU and NPU (untestable here; `onnxruntime-directml` conflicts with `onnxruntime`; little gain for small models). Nothing was run on the target machine.
+
 ## Decisions (initial build, 2026-10-04)
 
 - ~~Anthropic SDK for `extract`~~ replaced by local OCR on 2026-10-05.
@@ -87,4 +97,5 @@ Environment finding: `cadquery-ocp-novtk` links `libGL.so.1` directly (checked w
 1. Review and merge PR #2 (local extract).
 2. Decide the open assumptions above (especially bench 41 cm) and update specs/README if needed.
 3. Try `furniture extract` on further IKEA drawings; extend the mapping rules where the layout differs.
-4. Optional: add a GitHub Actions workflow (`uv sync`, `apt-get install libgl1`, `uv run pytest`).
+4. Run the test suite and a timing of `furniture extract` with `-j 1` vs default on the Framework Desktop (Windows).
+5. Optional: add a GitHub Actions workflow (`uv sync`, `apt-get install libgl1`, `uv run pytest`).
